@@ -1,0 +1,762 @@
+#!/usr/bin/env python3
+
+import sys
+import os
+import argparse
+import itertools
+import requests
+import bs4
+import bs4.dammit
+import threading
+import concurrent.futures
+import traceback
+import urllib.parse
+import pathlib
+import re
+import time
+import random
+
+import utils
+
+# defaults
+default_max_depth = 3
+default_max_threads = 10
+default_max_retries = 0
+default_out_dir = None
+
+# regex used to search for email addresses in pages
+email_regex = r"([a-zA-Z0-9_.+-]+@[a-zA-Z0-9-]+\.[a-zA-Z0-9-.]+)"
+
+# how long to sleep after failed requests
+fail_sleep = 1
+
+# file containing list of user agents
+user_agents_file = utils.basedir('user-agents.list')
+
+# known cloudflare title for identifying cloudflare pages
+cloudflare_title = 'Attention Required! | Cloudflare'
+
+# supported URL schemes
+supported_schemes = ['http', 'https', 'ftp']
+
+# known binary extensions
+binary_extensions = ['3dm', '3ds', '3g2', '3gp', '7z', 'a', 'aac', 'adp', 'ai',
+        'aif', 'aiff', 'alz', 'ape', 'apk', 'ar', 'arj', 'asf', 'au', 'avi',
+        'bak', 'baml', 'bh', 'bin', 'bk', 'bmp', 'btif', 'bz2', 'bzip2', 'cab',
+        'caf', 'cgm', 'class', 'cmx', 'cpio', 'cr2', 'cur', 'dat', 'dcm',
+        'deb', 'dex', 'djvu', 'dll', 'dmg', 'dng', 'doc', 'docm', 'docx',
+        'dot', 'dotm', 'dra', 'DS_Store', 'dsk', 'dts', 'dtshd', 'dvb', 'dwg',
+        'dxf', 'ecelp4800', 'ecelp7470', 'ecelp9600', 'egg', 'eol', 'eot',
+        'epub', 'exe', 'f4v', 'fbs', 'fh', 'fla', 'flac', 'fli', 'flv', 'fpx',
+        'fst', 'fvt', 'g3', 'gh', 'gif', 'graffle', 'gz', 'gzip', 'h261',
+        'h263', 'h264', 'icns', 'ico', 'ief', 'img', 'ipa', 'iso', 'jar',
+        'jpeg', 'jpg', 'jpgv', 'jpm', 'jxr', 'key', 'ktx', 'lha', 'lib', 'lvp',
+        'lz', 'lzh', 'lzma', 'lzo', 'm3u', 'm4a', 'm4v', 'mar', 'mdi', 'mht',
+        'mid', 'midi', 'mj2', 'mka', 'mkv', 'mmr', 'mng', 'mobi', 'mov',
+        'movie', 'mp3', 'mp4', 'mp4a', 'mpeg', 'mpg', 'mpga', 'mxu', 'nef',
+        'npx', 'numbers', 'nupkg', 'o', 'oga', 'ogg', 'ogv', 'otf', 'pages',
+        'pbm', 'pcx', 'pdb', 'pdf', 'pea', 'pgm', 'pic', 'png', 'pnm', 'pot',
+        'potm', 'potx', 'ppa', 'ppam', 'ppm', 'pps', 'ppsm', 'ppsx', 'ppt',
+        'pptm', 'pptx', 'psd', 'pya', 'pyc', 'pyo', 'pyv', 'qt', 'rar', 'ras',
+        'raw', 'resources', 'rgb', 'rip', 'rlc', 'rmf', 'rmvb', 'rtf', 'rz',
+        's3m', 's7z', 'scpt', 'sgi', 'shar', 'sil', 'sketch', 'slk', 'smv',
+        'snk', 'so', 'stl', 'suo', 'sub', 'swf', 'tar', 'tbz', 'tbz2', 'tga',
+        'tgz', 'thmx', 'tif', 'tiff', 'tlz', 'ttc', 'ttf', 'txz', 'udf', 'uvh',
+        'uvi', 'uvm', 'uvp', 'uvs', 'uvu', 'viv', 'vob', 'war', 'wav', 'wax',
+        'wbmp', 'wdp', 'weba', 'webm', 'webp', 'whl', 'wim', 'wm', 'wma',
+        'wmv', 'wmx', 'woff', 'woff2', 'wrm', 'wvx', 'xbm', 'xif', 'xla',
+        'xlam', 'xls', 'xlsb', 'xlsm', 'xlsx', 'xlt', 'xltm', 'xltx', 'xm',
+        'xmind', 'xpi', 'xpm', 'xwd', 'xz', 'z', 'zip', 'zipx']
+
+def random_user_agent():
+    """
+    Get a random user agent from the user_agents_file
+
+    :return: A random user agent
+    """
+
+    with open(user_agents_file, 'r') as fp:
+        user_agent = random.choice(fp.readlines()).strip()
+        return user_agent
+
+def soup_up(response):
+    """
+    Get BeautifulSoup object for requests.get() response. Handles encoding
+    correctly.
+
+    :param response: Response to parse
+    """
+
+    if 'charset' in response.headers.get('content-type', '').lower():
+        http_encoding = response.encoding
+    else:
+        http_encoding = None
+
+    html_encoding = bs4.dammit.EncodingDetector.find_declared_encoding(response.content, is_html=True)
+    encoding = html_encoding or http_encoding
+    soup = bs4.BeautifulSoup(response.content, features='lxml', from_encoding=encoding)
+
+    return soup
+
+class Scraper:
+    def __init__(self, urls, max_depth=default_max_depth,
+            max_retries=default_max_retries, pages=None, proxy=None,
+            user_agent=random_user_agent(), max_threads=default_max_threads,
+            stop_pattern=None, stop_on_404=False,
+            recurse_pattern=None, recurse_ignore_pattern=None,
+            requeue_cloudflare=False, cross_domains=False, domains=None, no_parent=False,
+            search_regex=None, search_emails=False, search_mailtos=False,
+            email_names=None, email_names_lines=None, depth_first=False,
+
+            # out params
+            out_dir=default_out_dir, out_urls=None, out_emails=None,
+            out_regex=None,
+
+            # download params
+            download_extensions=None, download_regexes=None, download_within=None):
+        # spider params
+        self.max_depth = max_depth
+        self.max_retries = max_retries
+        self.pages = pages
+        self.proxy = proxy
+        self.user_agent = user_agent
+        self.max_threads = max_threads
+        self.stop_pattern = stop_pattern
+        self.stop_on_404 = stop_on_404
+        self.recurse_pattern = recurse_pattern
+        self.recurse_ignore_pattern = recurse_ignore_pattern
+        self.requeue_cloudflare = requeue_cloudflare
+        self.cross_domains = cross_domains
+        self.domains = domains
+        self.no_parent = no_parent
+        self.search_regex = search_regex
+        self.search_emails = search_emails
+        self.search_mailtos = search_mailtos
+        self.email_names = email_names
+        self.email_names_lines = email_names_lines
+        self.depth_first = depth_first
+
+        # download params
+        self.download_extensions = download_extensions
+        self.download_regexes = download_regexes
+        self.download_within = download_within
+
+        # out params
+        self.out_dir = out_dir
+        self.out_urls = out_urls
+        self.out_emails = out_emails
+        self.out_regex = out_regex
+
+        self.pending_lock = threading.Lock()
+        self.output_lock = threading.Lock()
+        self.thread_pool = concurrent.futures.ThreadPoolExecutor(max_workers=max_threads)
+        self.running = False
+        self.stop_pattern_reached = False
+        self.futures = set()
+        # [(url, max_depth)]
+        self.pending_urls = []
+        self.seen_urls = set()
+
+        # add urls
+        for url in urls:
+            self.submit(url)
+
+    def scrape_url(self, url, max_depth):
+        # retrieve url
+        utils.debug('handling url {}'.format(url))
+
+        # parse the url for later
+        parsed_url = urllib.parse.urlparse(url)
+
+        # add schema if needed
+        if not parsed_url.scheme:
+            url = 'http://{}'.format(url)
+            parsed_url = urllib.parse.urlparse(url)
+
+        if parsed_url.scheme not in supported_schemes:
+            # unsupported url scheme
+            utils.debug('unsupported url scheme for url {}'.format(url) )
+            return
+
+        # must have netloc
+        if not parsed_url.netloc:
+            utils.bad('bad url: {}'.format(url))
+            return
+
+        # get the path extension
+        path_extension = parsed_url.path.split('.')[-1].lower()
+
+        # proxy
+        if self.proxy:
+            proxies = {
+                'http': self.proxy,
+                'https': self.proxy
+            }
+        else:
+            proxies = None
+
+        # user-agent
+        if self.user_agent:
+            headers = {
+                'User-Agent': self.user_agent,
+            }
+        else:
+            headers = None
+
+        # determine if the file will be downloaded
+        if self.download_extensions or self.download_regexes or self.download_within:
+            # only download certain things
+            download_file = False
+
+            if self.download_extensions:
+                # match by extension
+                extensions = [ext.lstrip('.') for ext in self.download_extensions]
+                if '.' in parsed_url.path and path_extension in extensions:
+                    download_file = True
+
+            if self.download_regexes:
+                # match path by regex
+                for regex in self.download_regexes:
+                    if re.match(regex, parsed_url.path, re.IGNORECASE):
+                        download_file = True
+                        break
+
+            if self.download_within:
+                # match by path leader
+                for leader in self.download_within:
+                    leader = leader.lstrip('/')
+                    if parsed_url.path.lstrip('/').startswith(leader):
+                        download_file = True
+                        break
+        else:
+            download_file = True
+
+        if not download_file and path_extension in binary_extensions:
+            # ignore probable binary files
+            # TODO make a flag to disable this
+            utils.debug('not requesting probable binary file {}'.format(url))
+            return
+
+        # make the request
+        retries = 0
+        while True:
+            try:
+                resp = requests.get(url, proxies=proxies, headers=headers, allow_redirects=True)
+            except Exception as e:
+                if retries >= self.max_retries:
+                    utils.bad("request to '{}' failed. will not retry".format(url, fail_sleep))
+                    utils.debug_exception(e)
+                    return
+                else:
+                    retries += 1
+                    utils.bad("request to '{}' failed. retrying in {} seconds, attempt {}/{}...".format(url,
+                        fail_sleep, retries, self.max_retries))
+                    utils.debug_exception(e)
+                    time.sleep(fail_sleep)
+                    continue
+
+            if resp.status_code == 404:
+                # 404 not found
+                if self.stop_on_404:
+                    utils.debug('received 404 for {}'.format(url))
+                    utils.bad("'{}' not found. stopping!".format(url))
+                    self.stop_softly()
+                else:
+                    utils.bad("'{}' not found".format(url))
+                return
+            elif resp.status_code == 403:
+                utils.debug('received 403 for {}'.format(url))
+                # check for cloudflare
+                soup = soup_up(resp)
+                title = soup.find('title').string
+                if cloudflare_title in title:
+                    if self.requeue_cloudflare:
+                        utils.bad("hit cloudflare at '{}'. will try again later".format(url))
+                        self.submit(url, max_depth)
+                        if url in self.seen_urls:
+                            self.seen_urls.remove(url)
+                    else:
+                        utils.bad("hit cloudflare at '{}'".format(url))
+                    return
+                else:
+                    utils.bad("request to '{}' failed with code 403 (forbidden)".format(url))
+            elif resp.status_code != 200:
+                utils.bad("request to '{}' failed with code {}".format(url, resp.status_code))
+                return
+            else:
+                utils.debug('received 200 for {}'.format(url))
+                break
+
+        regex_results = []
+        email_results = []
+
+        if 'text/html' in resp.headers['content-type']:
+            utils.debug('received HTML for {}'.format(url))
+            # search for stop pattern
+            if self.stop_pattern and not self.stop_pattern_reached:
+                if re.search(self.stop_pattern.encode(), resp.content):
+                    utils.info("found stop pattern on '{}'".format(url))
+                    self.stop_pattern_reached = True
+                    self.stop_softly()
+            
+            # search for regex
+            if self.search_regex:
+                for regex in self.search_regex:
+                    utils.debug('searching for regex: {}'.format(regex))
+                    lines = [line.decode() for line in resp.content.splitlines()]
+                    for number, line in enumerate(lines):
+                        for result in re.findall(regex, line):
+                            regex_results.append('{}:{}: {}'.format(url, number, result))
+
+            # search for emails
+            if self.search_emails or self.search_mailtos:
+                utils.debug('searching for emails')
+                lines = [line.decode() for line in resp.content.splitlines()]
+                for number, line in enumerate(lines):
+                    if self.search_emails:
+                        results = re.findall(email_regex, line)
+                    elif self.search_mailtos:
+                        results = re.findall(R'mailto:\s*' + email_regex, line)
+
+                    # go over results
+                    name = None
+                    for result in results:
+                        address = result.replace('mailto:', '')
+
+                        # search email names
+                        if self.email_names:
+                            if self.email_names_lines:
+                                # specific range of lines
+                                names_start, names_end = self.email_names_lines
+                                absolute_start = number + names_start
+                                absolute_end = number + names_end
+
+                                # keep in bounds
+                                absolute_end = min(absolute_end, len(lines) - 1)
+                                absolute_start = min(absolute_start, len(lines) - 1)
+                                absolute_end = max(absolute_end, 0)
+                                absolute_start = max(absolute_start, 0)
+
+                                # slice it up
+                                name_search_lines = lines[absolute_start:absolute_end + 1]
+                            else:
+                                name_search_lines = lines
+
+                            # line-by-line search for the name regex
+                            for line in name_search_lines:
+                                m = re.search(self.email_names, line)
+                                if m:
+                                    if len(m.groups()) > 0:
+                                        name = m.group(1)
+                                    else:
+                                        name = m.group(0)
+                                    break
+
+                            # default name is address
+                            if not name:
+                                name = address
+
+                        address = address.strip()
+                        if name:
+                            name = name.strip()
+                            email_results.append('{} <{}>'.format(name, address))
+                        else:
+                            email_results.append(address)
+
+            # recurse
+            if max_depth and not self.stop_pattern_reached:
+                soup = soup_up(resp)
+
+                new_url_count = 0
+
+                # gather new urls
+                new_urls = []
+                # <a href>
+                new_urls += [link['href'] for link in soup.find_all('a', href=True)]
+                # <img src>
+                new_urls += [img['src'] for img in soup.find_all('img')]
+                # TODO extend this
+
+                utils.debug('checking {} new recursion urls for {}'.format(len(new_urls), url))
+                for new_url in new_urls:
+                    # already seen?
+                    if new_url in self.seen_urls:
+                        continue
+
+                    # parse the url
+                    if new_url.startswith('/'):
+                        new_url = '{}{}'.format(parsed_url.netloc, new_url)
+
+                    parsed_new_url = urllib.parse.urlparse(new_url)
+
+                    if not parsed_new_url.scheme:
+                        # add a scheme
+                        new_url = 'http://{}'.format(new_url)
+                        parsed_new_url = urllib.parse.urlparse(new_url)
+
+                    ok_to_add = True
+
+                    if parsed_url.scheme not in supported_schemes:
+                        # unsupported url scheme
+                        ok_to_add = False
+
+                    # recurse pattern
+                    if self.recurse_pattern:
+                        for pattern in self.recurse_pattern: 
+                            m = re.match(pattern, parsed_new_url.path)
+                            if m:
+                                break
+                        else:
+                            ok_to_add = False
+
+                    # recurse ignore pattern
+                    if self.recurse_ignore_pattern:
+                        for pattern in self.recurse_ignore_pattern: 
+                            m = re.match(pattern, parsed_new_url.path)
+                            if m:
+                                ok_to_add = False
+                                break
+
+                    # no parent
+                    if self.no_parent:
+                        parent_path = parsed_url.path.rstrip('/') + '/'
+                        if not parsed_new_url.path.startswith(parent_path):
+                            utils.debug("not adding non-child url {}".format(new_url))
+                            ok_to_add = False
+
+                    # cross domains
+                    if not self.cross_domains:
+                        if self.domains:
+                            # specific domains (and current domain)
+                            if parsed_url.netloc not in self.domains + [parsed_url.netloc]:
+                                utils.debug("not adding cross-domain url {}".format(new_url))
+                                ok_to_add = False
+                        else:
+                            # current domain only
+                            if parsed_new_url.netloc != parsed_url.netloc:
+                                utils.debug("not adding cross-domain url {}".format(new_url))
+                                ok_to_add = False
+
+                    # add it
+                    if ok_to_add:
+                        utils.debug('added url {} from spider (depth {})'.format(new_url, max_depth - 1))
+                        new_url_count += 1
+                        self.submit(new_url, max_depth - 1)
+
+                # display new url count
+                if new_url_count:
+                    utils.info('added {} new urls from {}'.format(new_url_count, url))
+
+        # output
+        with self.output_lock:
+            # write to urls file
+            if self.out_urls:
+                utils.writelines(self.out_urls, [url])
+
+            if self.out_dir:
+                if not download_file:
+                    utils.debug('not downloading {}'.format(url))
+                else:
+                    # write to out directory
+                    parsed_path = parsed_url.path.split('/')
+                    subpath = parsed_path[:-1]
+                    subfile = parsed_path[-1]
+                    subdir = '{}/{}/{}/'.format(self.out_dir, parsed_url.netloc, '/'.join(subpath))
+
+                    if parsed_url.params:
+                        subfile += ';' + parsed_url.params
+                    if parsed_url.query:
+                        subfile += '?' + parsed_url.query
+                    if parsed_url.fragment:
+                        subfile += '#' + parsed_url.fragment
+
+                    pathlib.Path(subdir).mkdir(parents=True, exist_ok=True)
+                    out_path = '{}/{}'.format(subdir, subfile)
+
+                    # append '/directory_content' if this is already a directory
+                    if os.path.isdir(out_path):
+                        out_path += '/directory_content'
+
+                    utils.debug('downloading {} to {}'.format(url, out_path))
+                    with open(out_path, 'wb+') as fp:
+                        fp.write(resp.content)
+
+            # regex results
+            if regex_results:
+                if self.out_regex:
+                    utils.good('writing {} regex results to file'.format(len(regex_results)))
+                    utils.writelines(self.out_regex, regex_results)
+                else:
+                    for result in regex_results:
+                        utils.good('matched regex: {}'.format(result))
+
+            # email results
+            if email_results:
+                if self.out_emails:
+                    utils.good('writing {} email results to file'.format(len(email_results)))
+                    utils.writelines(self.out_emails, email_results)
+                else:
+                    for result in email_results:
+                        utils.good('found email: {}'.format(result))
+
+    def stop_softly(self):
+        self.pending()
+        for future in self.futures:
+            if not future.running():
+                future.cancel()
+
+    def stop(self):
+        self.stop_softly()
+        self.running = False
+
+    def submit(self, url, max_depth=None):
+        with self.pending_lock:
+            if max_depth is not None:
+                if max_depth < 0:
+                    # already reached max depth (safety)
+                    return False
+
+                new_item = (url, max_depth)
+            else:
+                new_item = (url, self.max_depth)
+
+            # add it
+            if self.depth_first:
+                self.pending_urls.insert(0, new_item)
+            else:
+                self.pending_urls.append(new_item)
+
+        return True
+
+    def pending(self):
+        with self.pending_lock:
+            old = self.pending_urls
+            self.pending_urls = []
+            return old
+
+    def handle_completed_futures(self, futures):
+        for future in futures:
+            if not future.done():
+                raise RuntimeError('attempted to handle unfinished future')
+
+            try:
+                exc = future.exception()
+                if exc:
+                    raise exc
+            except Exception as e:
+                if not isinstance(e, concurrent.futures._base.CancelledError):
+                    utils.debug('a future failed with exception:\n' + traceback.format_exc(limit=6))
+
+    def start(self):
+        self.running = True
+
+        # resolve {page} symbols for initial urls
+        pending = self.pending()
+        if self.pages:
+            iter_urls = iter([])
+
+            for page_url, max_depth in pending:
+                if '{page}' in page_url:
+                    page_urls = (
+                                    (page_url.replace('{page}', str(page)), max_depth) for page in utils.parse_ranges(self.pages)
+                                )
+                    iter_urls = itertools.chain(iter_urls, page_urls)
+        else:
+            iter_urls = iter(pending)
+
+        while self.running:
+            if not self.stop_pattern_reached:
+                # submit urls. only submits max_threads + 2 at a time, in case the generated url list is huge
+                for url, max_depth in iter_urls:
+                    if url in self.seen_urls:
+                        utils.debug('{} already seen'.format(url))
+                    else:
+                        self.seen_urls.add(url)
+                        future = self.thread_pool.submit(self.scrape_url, url, max_depth)
+                        self.futures.add(future)
+                        if len(self.futures) > self.max_threads + 1:
+                            break
+
+            utils.debug('waiting for {} futures'.format(len(self.futures)))
+            done, self.futures = concurrent.futures.wait(self.futures, return_when=concurrent.futures.FIRST_COMPLETED)
+            utils.debug('handling {} completed futures'.format(len(done)))
+            self.handle_completed_futures(done)
+
+            pending = self.pending()
+            if pending and not self.stop_pattern_reached:
+                # handle new urls
+                utils.debug('adding {} pending urls'.format(len(pending)))
+                iter_urls = itertools.chain(iter_urls, iter(pending))
+            elif not self.futures:
+                # all finished
+                utils.debug('all finished')
+                self.running = False
+                break
+
+def main():
+    parser = argparse.ArgumentParser()
+
+    # input options
+    group = parser.add_argument_group('input options')
+    group.add_argument('-f', '--file', action='append',
+            help='url file')
+
+    # spider options
+    group = parser.add_argument_group('spider options')
+    group.add_argument('-r', '--recurse', action='store_true',
+            help='recurse urls')
+    group.add_argument('-d', '--max-depth', type=int, default=default_max_depth,
+            help='max recursion depth (use with --recurse) (default: {})'.format(default_max_depth))
+    group.add_argument('-m', '--max-retries', type=int, default=default_max_retries,
+            help='maximum number of times to retry a request (default: {})'.format(default_max_retries))
+    group.add_argument('-p', '--pages', action='append',
+            help='replace {page} in each url with a range of page numbers. e.g. -p 1-2 -p 5,6-10')
+    group.add_argument('--proxy',
+            help='use proxy (supports http, https, socks4, and socks5 schemas)')
+    group.add_argument('-A', '--user-agent',
+            help='user agent (default: random)')
+    group.add_argument('-t', '--max-threads', type=int, default=default_max_threads,
+            help='maximum number of threads to use at once (default: {})'.format(default_max_threads))
+    group.add_argument('-s', '--stop-pattern',
+            help='stop on pattern')
+    group.add_argument('--stop-on-404', action='store_true',
+            help='stop on 404')
+    group.add_argument('--requeue-cloudflare', action='store_true',
+            help='requeue cloudflare urls (useful with a rotating proxy)')
+    group.add_argument('--recurse-pattern', action='append',
+            help='only recurse on urls matching one of these regex patterns')
+    group.add_argument('--recurse-ignore-pattern', action='append',
+            help='do not recurse on urls matching one of these regex patterns')
+    group.add_argument('--cross-domains', action='store_true',
+            help="allow recursion to cross domains to any domain")
+    group.add_argument('--domains', action='append',
+            help="allow recursion to cross to specific domains")
+    group.add_argument('-n', '--no-parent', action='store_true',
+            help="don't touch parent urls")
+    group.add_argument('--depth-first', action='store_true',
+            help="spider depth-first")
+
+    # download options
+    group = parser.add_argument_group('download options')
+    group.add_argument('--download-extension', action='append',
+            help='download files with specified extension (use with --out-dir)')
+    group.add_argument('--download-regex', action='append',
+            help='download files with URL paths matching a regex (use with --out-dir)')
+    group.add_argument('--download-within', action='append',
+            help='download files with URL paths starting with a string (use with --out-dir)')
+
+    # search options
+    group = parser.add_argument_group('search options')
+    group.add_argument('--search-regex', action='append',
+            help='search for a custom regex (see also --out-regex)')
+    group.add_argument('--search-emails', action='store_true',
+            help='search for emails (see also --out-emails)')
+    group.add_argument('--search-mailtos', action='store_true',
+            help='search for emails in mailto: format')
+    group.add_argument('--email-names',
+            help='regex search for names with emails (good for spidering structured contact lists)')
+    group.add_argument('--email-names-lines',
+            help='line numbers relative to each email address to search for the name regex. this is useful for contact lists (format: <start> [end])')
+
+    # output options
+    group = parser.add_argument_group('output options')
+    group.add_argument('-o', '--out-dir', default=default_out_dir,
+            help='output directory for scraped pages (default: {})'.format(default_out_dir))
+    group.add_argument('--out-urls',
+            help='output file for scraped urls (intended for use with recurse) (default: none)')
+    group.add_argument('--out-emails',
+            help='output file for scraped emails (default: stdout)')
+    group.add_argument('--out-regex',
+            help='output file for custom regex (default: stdout)')
+    group.add_argument('--out-log',
+            help='tee console output to file')
+
+    # main options
+    parser.add_argument('-D', '--debug', action='store_true',
+            help='debug mode')
+    group.add_argument('url', nargs='*',
+            help='urls')
+
+    args = parser.parse_args()
+
+    # -D/--debug
+    if args.debug:
+        utils.enable_debug()
+
+    # --out-log
+    if args.out_log:
+        utils.log_file = args.out_log
+
+    # url
+    urls = []
+    if args.url:
+        utils.good('adding {} url(s)'.format(len(args.url)))
+        urls += args.url
+
+    # -f/--file
+    if args.file:
+        for fname in args.file:
+            with open(fname, 'r') as fp:
+                new_urls = [line.strip() for line in fp]
+                urls += new_urls
+                utils.good("adding {} url(s) from '{}'".format(len(new_urls), fname))
+
+    # check urls
+    if not urls:
+        utils.die('specify some urls to spider')
+
+    # check output
+    if not (args.out_dir or args.out_urls or args.out_emails or args.out_regex or args.search_emails or args.search_mailtos or args.search_regex):
+        utils.die('specify an output method')
+
+    # -d/--max-depth, -r/--recurse
+    if args.recurse:
+        max_depth = args.max_depth
+    else:
+        max_depth = 0
+
+    # check --search-regex
+    if args.search_regex:
+        for regex in args.search_regex:
+            try:
+                re.compile(regex)
+            except Exception as e:
+                utils.die("failed to compile regex '{}': {}".format(regex, str(e)))
+
+    # -A/--user-agent
+    if args.user_agent:
+        user_agent = args.user_agent
+    else:
+        user_agent = random_user_agent()
+        utils.info('using user agent: {}'.format(user_agent))
+
+    # --email-names-lines
+    if args.email_names_lines:
+        parts = args.email_names_lines.split()
+        start = int(parts[0])
+        if len(parts) == 1:
+            end = start
+        email_names_lines = (start, end)
+    else:
+        email_names_lines = None
+
+    # scrape pages
+    scraper = Scraper(urls, max_depth=max_depth, max_retries=args.max_retries,
+            pages=args.pages, proxy=args.proxy, user_agent=user_agent,
+            max_threads=args.max_threads, stop_pattern=args.stop_pattern,
+            stop_on_404=args.stop_on_404, recurse_pattern=args.recurse_pattern,
+            recurse_ignore_pattern=args.recurse_ignore_pattern,
+            requeue_cloudflare=args.requeue_cloudflare,
+            depth_first=args.depth_first,
+            cross_domains=args.cross_domains, domains=args.domains, no_parent=args.no_parent,
+            search_regex=args.search_regex, search_emails=args.search_emails,
+            search_mailtos=args.search_mailtos, email_names=args.email_names,
+            email_names_lines=email_names_lines, out_dir=args.out_dir,
+            out_urls=args.out_urls, out_emails=args.out_emails,
+            out_regex=args.out_regex,
+            download_extensions=args.download_extension, download_regexes=args.download_regex,
+            download_within=args.download_within)
+    scraper.start()
+
+if __name__ == '__main__':
+    main()
